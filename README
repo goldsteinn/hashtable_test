@@ -1,0 +1,46 @@
+Setting different parameters is done by passing flags to the Makefile
+
+At the top of driver.cpp all flags and values are explained.
+
+Usage: $> make <options>
+
+The output will be an executable named "driver-K=<key type set>-V=<val type set>-etc...."
+
+
+The program will intialize keys/values to test insert/remove/query on
+your hashtable and my hashtable. Between running yours and mine the
+program will clear the data cache and sleep briefly. A basic summary
+of the runtime and parameters will be printed after both the run of
+your table and mine.
+
+Examples:
+To build a table with:
+key type            = uint32_t
+val type            = uint32_t
+number inserts      = 100000
+number of inserts who succeed (non duplicate) = 95%
+queries per insert  = 10
+number of queries to keys that are found = 51%
+removes per insert  = .05
+number of removes to keys that are found = 25%
+
+$> make K=INT32 V=INT32 LEN=100000 IFR=.05 QR=10 QFR=.49 RR=.05 RFR=.75
+
+this will result in an executable named:
+'driver-K=INT32-V=INT32-K_LEN=0-V_LEN=0-ISIZE=-LEN=100000-QR=10-RR=.05-IFR=.05-QFR=.49-RFR=.75'
+
+To do the same with key type as std::string each of which has a length of 10 do the following
+Note if K and/or V is set to string K_LEN and/or V_LEN must be set aswell
+
+$> make K=STRING K_LEN=10 V=INT32 LEN=100000 IFR=.05 QR=10 QFR=.49 RR=.05 RFR=.75
+
+this will result in an executable named:
+driver-K=STRING-V=INT32-K_LEN=10-V_LEN=0-ISIZE=-LEN=100000-QR=10-RR=.05-IFR=.05-QFR=.49-RFR=.75
+
+
+
+
+
+
+
+

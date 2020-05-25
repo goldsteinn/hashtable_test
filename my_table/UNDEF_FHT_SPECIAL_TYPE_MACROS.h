@@ -1,0 +1,33 @@
+#undef FHT_PP_NARG
+#undef FHT_PP_NARG_
+#undef FHT_PP_NARG_N
+#undef FHT_PP_RSEQ_N
+
+#undef FHT_PRIMITIVE_CAT
+#undef FHT_CAT
+
+#undef FHT_APPLY_OP
+#undef FHT_APPLY_OP_1
+#undef FHT_APPLY_OP_2
+#undef FHT_APPLY_OP_3
+#undef FHT_APPLY_OP_4
+#undef FHT_APPLY_OP_5
+#undef FHT_APPLY_OP_6
+#undef FHT_APPLY_OP_7
+#undef FHT_APPLY_OP_8
+#undef FHT_APPLY_OP_9
+#undef FHT_APPLY_OP_10
+#undef FHT_APPLY_OP_11
+#undef FHT_APPLY_OP_12
+#undef FHT_APPLY_OP_13
+#undef FHT_APPLY_OP_14
+#undef FHT_APPLY_OP_15
+#undef FHT_APPLY_OP_16
+#undef FHT_APPLY_OP_17
+#undef FHT_APPLY_OP_18
+#undef FHT_APPLY_OP_19
+#undef FHT_APPLY_OP_20
+
+#undef FHT_IS_SAME
+#undef FHT_IS_SPECIAL
+#undef FHT_NOT_SPECIAL
