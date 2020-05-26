@@ -135,6 +135,12 @@ struct DEFAULT_HASH_32;
 
 template<typename K, typename V>
 struct DEFAULT_MMAP_ALLOC;
+
+// this will perform significantly better if the copy time on either keys or
+// values is large (it tries to avoid at least a portion of the copying step in
+// resize)
+template<typename K, typename V>
+struct INPLACE_MMAP_ALLOC;
 //////////////////////////////////////////////////////////////////////
 
 // forward declaration of some basic helpers
@@ -345,7 +351,7 @@ template<typename K,
          typename V,
          typename Returner  = DEFAULT_RETURNER<V>,
          typename Hasher    = DEFAULT_HASH_32<K>,
-         typename Allocator = DEFAULT_MMAP_ALLOC<K, V>>
+         typename Allocator = INPLACE_MMAP_ALLOC<K, V>>
 class fht_table {
 
     // log of table size
@@ -359,8 +365,27 @@ class fht_table {
     Allocator alloc_mmap;
     Returner  returner;
 
-    // double table size and re-place node
-    fht_chunk<K, V> * const resize();
+    // in place resize, only works with INPLACE allocator
+    template<typename _K         = K,
+             typename _V         = V,
+             typename _Returner  = Returner,
+             typename _Hasher    = Hasher,
+             typename _Allocator = Allocator>
+    typename std::enable_if<
+        std::is_same<_Allocator, INPLACE_MMAP_ALLOC<_K, _V>>::value,
+        fht_chunk<_K, _V> * const>::type
+    resize();
+
+    // standard resize which copies all elements
+    template<typename _K         = K,
+             typename _V         = V,
+             typename _Returner  = Returner,
+             typename _Hasher    = Hasher,
+             typename _Allocator = Allocator>
+    typename std::enable_if<
+        !(std::is_same<_Allocator, INPLACE_MMAP_ALLOC<_K, _V>>::value),
+        fht_chunk<_K, _V> * const>::type
+    resize();
 
     template<typename T>
     using pass_type_t =
@@ -475,13 +500,223 @@ fht_table<K, V, Returner, Hasher, Allocator>::~fht_table() {
 //////////////////////////////////////////////////////////////////////
 
 //////////////////////////////////////////////////////////////////////
-// Resize
+// Resize In Place
 template<typename K,
          typename V,
          typename Returner,
          typename Hasher,
          typename Allocator>
-fht_chunk<K, V> * const
+template<typename _K,
+         typename _V,
+         typename _Returner,
+         typename _Hasher,
+         typename _Allocator>
+typename std::enable_if<
+    std::is_same<_Allocator, INPLACE_MMAP_ALLOC<_K, _V>>::value,
+    fht_chunk<_K, _V> * const>::type
+fht_table<K, V, Returner, Hasher, Allocator>::resize() {
+
+    // incr table log
+    const uint32_t          _new_log_incr = ++(this->log_incr);
+    fht_chunk<K, V> * const old_chunks    = this->chunks;
+
+
+    const uint32_t _num_chunks =
+        (1 << (_new_log_incr - 1)) / FHT_NODES_PER_CACHE_LINE;
+
+    // allocate new chunk array
+    fht_chunk<K, V> * const new_chunks = this->alloc_mmap.init_mem(_num_chunks);
+
+    uint32_t to_replace_idx = 0;
+    // techincally max number of items possible (though hyper unlikely)
+    uint32_t to_replace_raw_slots[L1_CACHE_LINE_SIZE];
+
+
+    uint32_t move_order[L1_CACHE_LINE_SIZE];
+    uint32_t move_order_idx, from_idx, complete;
+    uint64_t prev_placed;
+    K        temp_K;
+    V        temp_V;
+    uint8_t  temp_tag;
+
+    // iterate through all chunks and re-place nodes
+    for (uint32_t i = 0; i < _num_chunks; i++) {
+        uint64_t                to_replace = 0, ideal_idx = 0;
+        fht_chunk<K, V> * const old_chunk = old_chunks + i;
+        fht_chunk<K, V> * const new_chunk = new_chunks + i;
+        for (uint32_t j = 0; j < FHT_NODES_PER_CACHE_LINE; j++) {
+
+            // if node is invalid or deleted skip it
+            if (RESIZE_SKIP(old_chunk->get_tag_n(j))) {
+                old_chunk->tags[j] = 0;
+                continue;
+            }
+            const uint32_t raw_slot  = this->hash_32(old_chunk->get_key_n(j));
+            const uint32_t start_idx = GEN_START_IDX(raw_slot);
+
+            if (GET_NTH_BIT(raw_slot, _new_log_incr - 1)) {
+                const uint8_t tag  = old_chunk->get_tag_n(j);
+                old_chunk->tags[j] = 0;
+                // place new node w.o duplicate check
+                for (uint32_t new_j = 0; new_j < FHT_SEARCH_NUMBER; new_j++) {
+                    const uint32_t test_idx = GEN_TEST_IDX(start_idx, new_j);
+                    if (__builtin_expect(
+                            !IS_VALID(new_chunk->get_tag_n(test_idx)),
+                            1)) {
+                        new_chunk->set_key_val_tag(test_idx,
+                                                   old_chunk->get_key_n(j),
+                                                   old_chunk->get_val_n(j),
+                                                   tag);
+                        break;
+                    }
+                }
+            }
+            else if ((start_idx & FHT_CACHE_IDX_MASK) != j) {
+                // if we can lets try and avoid to many cases next
+                for (uint32_t new_j = 0;
+                     new_j < 4 &&
+                     (ideal_idx & ((1UL) << GEN_TEST_IDX(start_idx, new_j)));
+                     new_j++) {
+                    if (GEN_TEST_IDX(start_idx, new_j + 1) == j) {
+                        ideal_idx |= ((1UL) << j);
+                        break;
+                    }
+                }
+                if (!(ideal_idx & ((1UL) << j))) {
+                    old_chunk->tags[j] = 0;
+                    to_replace |= ((1UL) << j);
+                    to_replace_raw_slots[j] = raw_slot;
+                    to_replace_idx++;
+                }
+            }
+            else {
+                ideal_idx |= ((1UL) << j);
+            }
+        }
+
+        uint64_t idx;
+        // the reality is even though this adds an int + operation branch
+        // predictor is much better with standard loops than bitscan loops
+        for (uint32_t j = 0; j < to_replace_idx; j++) {
+            __asm__("tzcnt %1, %0" : "=r"((idx)) : "rm"((to_replace)));
+            to_replace ^= ((1UL) << idx);
+
+            const uint32_t raw_slot  = to_replace_raw_slots[idx];
+            const uint32_t start_idx = GEN_START_IDX(raw_slot);
+            const uint8_t  tag       = GEN_TAG(raw_slot) | VALID_MASK;
+            for (uint32_t new_j = 0; new_j < FHT_SEARCH_NUMBER; new_j++) {
+                const uint32_t test_idx = GEN_TEST_IDX(start_idx, new_j);
+                if (test_idx == idx) {
+                    old_chunk->tags[idx] = tag;
+                    break;
+                }
+                else if (to_replace & ((1UL) << test_idx)) {
+                    prev_placed    = 0;
+                    move_order_idx = 1;
+                    move_order[0]  = idx;
+                    move_order[0] <<= 16;       // from slot
+                    move_order[0] |= test_idx;  // to slot
+                    from_idx = test_idx;
+                    prev_placed |= ((1UL) << test_idx);
+                    complete = 0;
+                    do {
+                        const uint32_t _raw_slot =
+                            to_replace_raw_slots[from_idx];
+                        const uint32_t _start_idx = GEN_START_IDX(_raw_slot);
+                        const uint8_t  _tag = GEN_TAG(_raw_slot) | VALID_MASK;
+
+                        for (uint32_t _new_j = 0; _new_j < FHT_SEARCH_NUMBER;
+                             _new_j++) {
+                            const uint32_t _test_idx =
+
+                                GEN_TEST_IDX(_start_idx, _new_j);
+                            if (_test_idx == idx) {
+                                temp_K   = old_chunk->get_key_n(from_idx);
+                                temp_V   = old_chunk->get_val_n(from_idx);
+                                temp_tag = _tag;
+                                complete = 2;
+                                break;
+                            }
+                            else if (prev_placed & ((1UL) << _test_idx)) {
+                                continue;
+                            }
+                            else if (to_replace & ((1UL) << _test_idx)) {
+
+                                move_order[move_order_idx] = from_idx;
+                                move_order[move_order_idx] <<= 16;  // from slot
+                                move_order[move_order_idx++] |=
+                                    _test_idx;  // to slot
+                                from_idx = _test_idx;
+                                prev_placed |= ((1UL) << _test_idx);
+                                break;
+                            }
+                            // from testing I don't think this is really
+                            // expected
+                            else if (!IS_VALID(
+                                         old_chunk->get_tag_n(_test_idx))) {
+                                old_chunk->set_key_val_tag(
+                                    _test_idx,
+                                    old_chunk->get_key_n(from_idx),
+                                    old_chunk->get_val_n(from_idx),
+                                    _tag);
+                                // completion
+                                // unwind
+                                complete = 1;
+                                break;
+                            }
+                        }
+                    } while (!complete);
+                    for (int32_t in_j = move_order_idx - 1; in_j >= 0; in_j--) {
+                        const uint32_t to_slot   = move_order[in_j] & 0xffff;
+                        const uint32_t from_slot = move_order[in_j] >> 16;
+                        const uint8_t  _tag =
+                            GEN_TAG(to_replace_raw_slots[from_slot]) |
+                            VALID_MASK;
+
+                        to_replace ^= ((1UL) << to_slot);
+                        to_replace_idx--;
+                        old_chunk->set_key_val_tag(
+                            to_slot,
+                            old_chunk->get_key_n(from_slot),
+                            old_chunk->get_val_n(from_slot),
+                            _tag);
+                    }
+                    if (complete == 2) {
+                        old_chunk->set_key_val_tag(idx,
+                                                   temp_K,
+                                                   temp_V,
+                                                   temp_tag);
+                    }
+                    break;
+                }
+                else if (old_chunk->get_tag_n(test_idx)) {
+                    old_chunk->set_key_val_tag(test_idx,
+                                               old_chunk->get_key_n(idx),
+                                               old_chunk->get_val_n(idx),
+                                               tag);
+                    break;
+                }
+            }
+        }
+        to_replace_idx = 0;
+    }
+    return old_chunks;
+}
+
+// Resize Standard
+template<typename K,
+         typename V,
+         typename Returner,
+         typename Hasher,
+         typename Allocator>
+template<typename _K,
+         typename _V,
+         typename _Returner,
+         typename _Hasher,
+         typename _Allocator>
+typename std::enable_if<
+    !(std::is_same<_Allocator, INPLACE_MMAP_ALLOC<_K, _V>>::value),
+    fht_chunk<_K, _V> * const>::type
 fht_table<K, V, Returner, Hasher, Allocator>::resize() {
 
     // incr table log
@@ -688,7 +923,8 @@ fht_table<K, V, Returner, Hasher, Allocator>::find(key_pass_t key,
             return FHT_NOT_FOUND;
         }
 
-        // if tag and key match store val in store_val variable provided by user
+        // if tag and key match store val in store_val variable provided by
+        // user
         else if ((chunk->get_tag_n(test_idx) == tag) &&
                  chunk->compare_key_n(test_idx, key)) {
             this->returner.to_ret_type(store_val,
@@ -717,8 +953,8 @@ typename std::enable_if<FHT_NOT_SPECIAL(FHT_SPECIAL_TYPES),
                         const uint32_t>::type
 fht_table<K, V, Returner, Hasher, Allocator>::remove(key_pass_t key) const {
 
-    // basically exact same as find but instead of storing the val just set tag
-    // to deleted
+    // basically exact same as find but instead of storing the val just set
+    // tag to deleted
 
     const uint32_t          _log_incr = this->log_incr;
     const uint32_t          raw_slot  = this->hash_32(key);
@@ -772,8 +1008,8 @@ fht_table<K, V, Returner, Hasher, Allocator>::find(key_pass_t key,
     const uint32_t raw_slot  = this->hash_32(key);
 
     // instead of doing everything through calls to just do directly. My
-    // compiler at least does a bad job of optimizing out many of the reference
-    // passes
+    // compiler at least does a bad job of optimizing out many of the
+    // reference passes
     const uint8_t * const tags = (const uint8_t * const)(
         (this->chunks) +
         ((raw_slot & (TO_MASK(_log_incr) & FHT_CACHE_ALIGN_MASK)) /
@@ -784,9 +1020,9 @@ fht_table<K, V, Returner, Hasher, Allocator>::find(key_pass_t key,
     const uint8_t  tag       = GEN_TAG(raw_slot) | VALID_MASK;
     const uint32_t start_idx = GEN_START_IDX(raw_slot);
 
-    // this is the key to seperate find. Basically instead of passing reference
-    // to string to all of the chunk helper functions we can gurantee inline and
-    // use direct values
+    // this is the key to seperate find. Basically instead of passing
+    // reference to string to all of the chunk helper functions we can
+    // gurantee inline and use direct values
     const fht_node<K, V> * const nodes =
         (const fht_node<K, V> * const)(tags + FHT_NODES_PER_CACHE_LINE);
 
@@ -794,8 +1030,8 @@ fht_table<K, V, Returner, Hasher, Allocator>::find(key_pass_t key,
     __builtin_prefetch(nodes + (start_idx & FHT_CACHE_IDX_MASK));
 
 
-    // check for valid slot of duplicate. Same logic as other find just doing
-    // direct calls instead of via helper functions
+    // check for valid slot of duplicate. Same logic as other find just
+    // doing direct calls instead of via helper functions
     for (uint32_t j = 0; j < FHT_SEARCH_NUMBER; j++) {
         // seeded with start_idx we go through idx function
         const uint32_t test_idx = GEN_TEST_IDX(start_idx, j);
@@ -1193,6 +1429,83 @@ struct OPTIMIZED_MMAP_ALLOC {
     }
 };
 
+// less syscalls this way
+template<typename K, typename V>
+struct INPLACE_MMAP_ALLOC {
+
+
+    size_t start_offset;
+    void * base_address;
+    INPLACE_MMAP_ALLOC() {
+        this->base_address = mymmap_alloc(FHT_MAX_MEMORY);
+        this->start_offset = 0;
+    }
+    ~INPLACE_MMAP_ALLOC() {
+        mymunmap(this->base_address, FHT_MAX_MEMORY);
+    }
+
+    constexpr void *
+    operator new(size_t size, void * ptr) {
+        return ptr;
+    }
+    constexpr void *
+    operator new[](size_t size, void * ptr) {
+        return ptr;
+    }
+
+    constexpr void
+    operator delete(void * ptr, const uint32_t size) {
+        // do nothing... deinit_mem is explicitly called
+    }
+
+    constexpr void
+    operator delete[](void * ptr, const uint32_t size) {
+        // do nothing... deinit_mem is explicitly called
+    }
+
+
+    template<typename _K = K, typename _V = V>
+    typename std::enable_if<
+        (std::is_arithmetic<_K>::value || std::is_pointer<_K>::value) &&
+            (std::is_arithmetic<_V>::value || std::is_pointer<_V>::value),
+        fht_chunk<K, V> * const>::type
+    init_mem(const size_t size) {
+        const size_t old_start_offset = this->start_offset;
+        this->start_offset += size * sizeof(fht_chunk<K, V>);
+        return (fht_chunk<K, V> * const)(
+            (void *)(((uint64_t)this->base_address) + old_start_offset));
+    }
+
+    template<typename _K = K, typename _V = V>
+    constexpr typename std::enable_if<
+        (std::is_arithmetic<_K>::value || std::is_pointer<_K>::value) &&
+            (std::is_arithmetic<_V>::value || std::is_pointer<_V>::value),
+        void>::type
+    deinit_mem(fht_chunk<K, V> * const ptr, const size_t size) const {
+        return;
+    }
+
+    template<typename _K = K, typename _V = V>
+    typename std::enable_if<
+        (!(std::is_arithmetic<_K>::value || std::is_pointer<_K>::value)) ||
+            (!(std::is_arithmetic<_V>::value || std::is_pointer<_V>::value)),
+        fht_chunk<K, V> * const>::type
+    init_mem(const size_t size) {
+        const size_t old_start_offset = this->start_offset;
+        this->start_offset += size * sizeof(fht_chunk<K, V>);
+        return (fht_chunk<K, V> * const) new (
+            this->base_address + old_start_offset) fht_chunk<K, V>[size];
+    }
+    template<typename _K = K, typename _V = V>
+    constexpr typename std::enable_if<
+        (!(std::is_arithmetic<_K>::value || std::is_pointer<_K>::value)) ||
+            (!(std::is_arithmetic<_V>::value || std::is_pointer<_V>::value)),
+        void>::type
+    deinit_mem(fht_chunk<K, V> * const ptr, const size_t size) const {
+        return;
+    }
+};
+
 
 template<typename K, typename V>
 struct MMAP_ALLOC {
@@ -1261,9 +1574,10 @@ struct DEFAULT_MMAP_ALLOC {
         mymunmap(ptr, size);
     }
 
-    // basically if we need constructor to be called we go to the overloaded new
-    // version. These are slower for simply types that can be initialized with
-    // just memset. For those types our init mem is compiled to just mmap.
+    // basically if we need constructor to be called we go to the overloaded
+    // new version. These are slower for simply types that can be
+    // initialized with just memset. For those types our init mem is
+    // compiled to just mmap.
     template<typename _K = K, typename _V = V>
     typename std::enable_if<
         (std::is_arithmetic<_K>::value || std::is_pointer<_K>::value) &&

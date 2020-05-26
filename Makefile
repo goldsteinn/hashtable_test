@@ -18,4 +18,4 @@ all:
 	$(CXX) $(CXXFLAGS) driver.o -o driver-K=$(K)-V=$(V)-K_LEN=$(K_LEN)-V_LEN=$(V_LEN)-ISIZE=$(INIT_SIZE)-LEN=$(LEN)-QR=$(QR)-RR=$(RR)-IFR=$(IFR)-QFR=$(QFR)-RFR=$(RFR)
 
 clean:
-	rm -rf *~ *#* *.o driver-K=*-V=*
+	rm -rf *~ *#* *.o driver-K=*-V=* my_table/*~
