@@ -1,5 +1,6 @@
 CXX=g++
-CXXFLAGS=-O3 -ggdb -march=native
+CXXFLAGS=-O3 -march=native
+
 
 K=INT32
 V=INT32
