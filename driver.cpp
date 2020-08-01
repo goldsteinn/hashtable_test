@@ -413,7 +413,7 @@ run_emb6(std::vector<test_key_t> & insert_keys,
         }
     }
     clock_gettime(CLOCK_MONOTONIC, &end_time);
-    report(&start_time, &end_time, "emhash5");
+    report(&start_time, &end_time, "emhash6");
 }
 
 static void
