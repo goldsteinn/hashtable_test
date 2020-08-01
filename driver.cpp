@@ -11,6 +11,11 @@
 #include "flat_table/flat_hash_map.hpp"
 #include "my_table/fht_ht.hpp"
 
+#include "emb5/emb5.hpp"
+#undef EMH_EMPTY
+#include "emb6/emb6.hpp"
+
+
 /*
     Key Types:
     INT32               -> uint32_t
@@ -177,6 +182,16 @@ static void init_query_keys(std::vector<test_key_t> & insert_keys,
 static void init_remove_keys(std::vector<test_key_t> & insert_keys,
                              std::vector<test_key_t> & remove_keys);
 
+static void run_emb5(std::vector<test_key_t> & insert_keys,
+                     std::vector<test_val_t> & insert_vals,
+                     std::vector<test_key_t> & query_keys,
+                     std::vector<test_key_t> & remove_keys);
+
+static void run_emb6(std::vector<test_key_t> & insert_keys,
+                     std::vector<test_val_t> & insert_vals,
+                     std::vector<test_key_t> & query_keys,
+                     std::vector<test_key_t> & remove_keys);
+
 static void run_my_table(std::vector<test_key_t> & insert_keys,
                          std::vector<test_val_t> & insert_vals,
                          std::vector<test_key_t> & query_keys,
@@ -214,9 +229,14 @@ main() {
     init_query_keys(insert_keys, query_keys);
     init_remove_keys(insert_keys, remove_keys);
 
+    clear_cache();
     run_my_table(insert_keys, insert_vals, query_keys, remove_keys);
     clear_cache();
     run_flat_table(insert_keys, insert_vals, query_keys, remove_keys);
+    clear_cache();
+    run_emb5(insert_keys, insert_vals, query_keys, remove_keys);
+    clear_cache();
+    run_emb6(insert_keys, insert_vals, query_keys, remove_keys);
 }
 
 static void
@@ -318,17 +338,82 @@ run_my_table(std::vector<test_key_t> & insert_keys,
 
     clock_gettime(CLOCK_MONOTONIC, &start_time);
     for (uint32_t i = 0; i < TEST_LEN; i++) {
-        test_table.add(insert_keys[i], insert_vals[i]);
+        test_table.emplace(insert_keys[i], insert_vals[i]);
         for (uint32_t j = i * QUERY_RATE; j < (i + 1) * QUERY_RATE; j++) {
-            volatile auto sink = test_table.find(query_keys[j], &vsink);
+            volatile auto sink = test_table.find(query_keys[j]);
         }
         if (i == next_remove) {
-            volatile auto sink = test_table.remove(remove_keys[remove_iter++]);
+            volatile auto sink = test_table.erase(remove_keys[remove_iter++]);
             next_remove += remove_incr;
         }
     }
     clock_gettime(CLOCK_MONOTONIC, &end_time);
     report(&start_time, &end_time, "My Hashtable");
+}
+
+static void
+run_emb5(std::vector<test_key_t> & insert_keys,
+         std::vector<test_val_t> & insert_vals,
+         std::vector<test_key_t> & query_keys,
+         std::vector<test_key_t> & remove_keys) {
+
+    struct timespec                          start_time, end_time;
+    emhash5::HashMap<test_key_t, test_val_t> test_table(INIT_SIZE);
+
+    uint32_t next_remove, remove_iter = 0;
+    next_remove =
+        REMOVE_RATE != 0 ? (uint32_t)(1.0 / ((float)REMOVE_RATE)) : TEST_LEN;
+
+    const uint32_t remove_incr = next_remove;
+
+    val_sink_t vsink;
+
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    for (uint32_t i = 0; i < TEST_LEN; i++) {
+        test_table.emplace(insert_keys[i], insert_vals[i]);
+        for (uint32_t j = i * QUERY_RATE; j < (i + 1) * QUERY_RATE; j++) {
+            volatile auto sink = test_table.find(query_keys[j]);
+        }
+        if (i == next_remove) {
+            volatile auto sink = test_table.erase(remove_keys[remove_iter++]);
+            next_remove += remove_incr;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    report(&start_time, &end_time, "emhash5");
+}
+
+
+static void
+run_emb6(std::vector<test_key_t> & insert_keys,
+         std::vector<test_val_t> & insert_vals,
+         std::vector<test_key_t> & query_keys,
+         std::vector<test_key_t> & remove_keys) {
+
+    struct timespec                          start_time, end_time;
+    emhash6::HashMap<test_key_t, test_val_t> test_table(INIT_SIZE);
+
+    uint32_t next_remove, remove_iter = 0;
+    next_remove =
+        REMOVE_RATE != 0 ? (uint32_t)(1.0 / ((float)REMOVE_RATE)) : TEST_LEN;
+
+    const uint32_t remove_incr = next_remove;
+
+    val_sink_t vsink;
+
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    for (uint32_t i = 0; i < TEST_LEN; i++) {
+        test_table.emplace(insert_keys[i], insert_vals[i]);
+        for (uint32_t j = i * QUERY_RATE; j < (i + 1) * QUERY_RATE; j++) {
+            volatile auto sink = test_table.find(query_keys[j]);
+        }
+        if (i == next_remove) {
+            volatile auto sink = test_table.erase(remove_keys[remove_iter++]);
+            next_remove += remove_incr;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    report(&start_time, &end_time, "emhash5");
 }
 
 static void
